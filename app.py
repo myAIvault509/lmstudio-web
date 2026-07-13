@@ -1,17 +1,69 @@
+import os
+from datetime import datetime
+
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
+
+
+# ---------------------------------------------------------
+# Flask setup
+# ---------------------------------------------------------
 
 app = Flask(__name__)
-CORS(app)
 
-LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
-LM_STUDIO_MODELS_URL = "http://127.0.0.1:1234/v1/models"
+# Allow your live website and local VS Code Live Server.
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": [
+                "https://systemsmyai.com",
+                "https://www.systemsmyai.com",
+                "https://myaivault509.github.io",
+                "http://127.0.0.1:5500",
+                "http://localhost:5500",
+            ]
+        }
+    },
+)
+
+
+# ---------------------------------------------------------
+# LM Studio configuration
+# ---------------------------------------------------------
+
+LM_STUDIO_BASE_URL = "http://127.0.0.1:1234"
+LM_STUDIO_CHAT_URL = f"{LM_STUDIO_BASE_URL}/v1/chat/completions"
+LM_STUDIO_MODELS_URL = f"{LM_STUDIO_BASE_URL}/v1/models"
+
+# This reads the token from Windows or from a .env setup later.
+# If LM Studio does not require a token, this may remain empty.
+LM_STUDIO_API_TOKEN = os.getenv("LM_STUDIO_API_TOKEN", "").strip()
+
+
+def get_lm_studio_headers():
+    """Build the request headers used when communicating with LM Studio."""
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if LM_STUDIO_API_TOKEN:
+        headers["Authorization"] = f"Bearer {LM_STUDIO_API_TOKEN}"
+
+    return headers
 
 
 def get_model_name():
-    """Get the first model currently available in LM Studio."""
-    response = requests.get(LM_STUDIO_MODELS_URL, timeout=10)
+    """Return the first model currently available in LM Studio."""
+
+    response = requests.get(
+        LM_STUDIO_MODELS_URL,
+        headers=get_lm_studio_headers(),
+        timeout=10,
+    )
+
     response.raise_for_status()
 
     model_data = response.json()
@@ -19,19 +71,53 @@ def get_model_name():
 
     if not models:
         raise RuntimeError(
-            "No model is loaded in LM Studio. Load a model and start the server."
+            "No model is loaded in LM Studio. "
+            "Load a model and start the LM Studio server."
         )
 
     return models[0]["id"]
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Test whether the Flask server is running."""
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def home():
+    """Show basic information when the API address is opened."""
+
     return jsonify(
         {
             "status": "online",
-            "message": "myAI Vault server is running."
+            "message": "Welcome to the myAI Vault API.",
+            "endpoints": {
+                "home": "/",
+                "health": "/health",
+                "chat": "/chat",
+            },
+        }
+    )
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Test whether Flask and LM Studio are available."""
+
+    lm_studio_status = "offline"
+    model_name = None
+
+    try:
+        model_name = get_model_name()
+        lm_studio_status = "online"
+    except Exception:
+        pass
+
+    return jsonify(
+        {
+            "status": "online",
+            "message": "myAI Vault Flask server is running.",
+            "lm_studio": lm_studio_status,
+            "model": model_name,
         }
     )
 
@@ -44,17 +130,26 @@ def chat():
         data = request.get_json(silent=True)
 
         if not data:
-            return jsonify({"error": "No data was received."}), 400
+            return jsonify(
+                {
+                    "error": "No JSON data was received.",
+                }
+            ), 400
 
-        user_message = data.get("message", "").strip()
+        user_message = str(data.get("message", "")).strip()
 
         if not user_message:
-            return jsonify({"error": "Please enter a question."}), 400
+            return jsonify(
+                {
+                    "error": "Please enter a question.",
+                }
+            ), 400
 
         model_name = get_model_name()
 
-        response = requests.post(
-            LM_STUDIO_URL,
+        lm_response = requests.post(
+            LM_STUDIO_CHAT_URL,
+            headers=get_lm_studio_headers(),
             json={
                 "model": model_name,
                 "messages": [
@@ -62,7 +157,8 @@ def chat():
                         "role": "system",
                         "content": (
                             "You are the private AI assistant for myAI Vault. "
-                            "Answer clearly, accurately, and professionally."
+                            "Answer clearly, accurately, helpfully, and "
+                            "professionally."
                         ),
                     },
                     {
@@ -77,10 +173,32 @@ def chat():
             timeout=180,
         )
 
-        response.raise_for_status()
+        lm_response.raise_for_status()
 
-        result = response.json()
-        ai_reply = result["choices"][0]["message"]["content"]
+        result = lm_response.json()
+
+        choices = result.get("choices", [])
+
+        if not choices:
+            return jsonify(
+                {
+                    "error": "LM Studio did not return an answer.",
+                }
+            ), 502
+
+        ai_reply = (
+            choices[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        if not ai_reply:
+            return jsonify(
+                {
+                    "error": "LM Studio returned an empty answer.",
+                }
+            ), 502
 
         return jsonify(
             {
@@ -93,8 +211,8 @@ def chat():
         return jsonify(
             {
                 "error": (
-                    "Could not connect to LM Studio. "
-                    "Open LM Studio, load a model, and start the local server."
+                    "Could not connect to LM Studio. Open LM Studio, "
+                    "load a model, and start the local server."
                 )
             }
         ), 503
@@ -103,13 +221,14 @@ def chat():
         return jsonify(
             {
                 "error": (
-                    "The model took too long to respond. "
-                    "Try again or use a smaller model."
+                    "The AI took too long to respond. Try again or "
+                    "use a smaller model."
                 )
             }
         ), 504
 
     except requests.exceptions.HTTPError as error:
+        status_code = 502
         details = ""
 
         if error.response is not None:
@@ -117,34 +236,49 @@ def chat():
 
         return jsonify(
             {
-                "error": "LM Studio returned an error.",
+                "error": "LM Studio returned an HTTP error.",
                 "details": details,
             }
-        ), 502
+        ), status_code
 
-    except (KeyError, IndexError, TypeError):
+    except RuntimeError as error:
         return jsonify(
             {
-                "error": "LM Studio returned an unexpected response."
+                "error": str(error),
+            }
+        ), 503
+
+    except (KeyError, IndexError, TypeError, ValueError):
+        return jsonify(
+            {
+                "error": "LM Studio returned an unexpected response.",
             }
         ), 502
 
     except Exception as error:
+        print(f"Unexpected server error: {error}")
+
         return jsonify(
             {
-                "error": str(error)
+                "error": "An unexpected server error occurred.",
             }
         ), 500
 
 
+# ---------------------------------------------------------
+# Start the server
+# ---------------------------------------------------------
+
 if __name__ == "__main__":
     print()
     print("myAI Vault server is starting.")
-    print("Health test: http://127.0.0.1:5000/health")
+    print("Home:   http://127.0.0.1:5000/")
+    print("Health: http://127.0.0.1:5000/health")
+    print("Chat:   http://127.0.0.1:5000/chat")
     print()
 
     app.run(
         host="127.0.0.1",
         port=5000,
-        debug=True,
+        debug=False,
     )
